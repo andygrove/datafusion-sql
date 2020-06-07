@@ -21,6 +21,11 @@ use super::tokenizer::*;
 use std::error::Error;
 use std::fmt;
 
+#[cfg(feature = "cst")]
+use crate::builder;
+
+use crate::{cst, cst::SyntaxKind as SK};
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParserError {
     TokenizerError(String),
@@ -32,6 +37,15 @@ macro_rules! parser_err {
     ($MSG:expr) => {
         Err(ParserError::ParserError($MSG.to_string()))
     };
+}
+
+/// The parser state
+#[derive(Clone)]
+pub struct Marker {
+    /// position in the token stream (`parser.index`)
+    index: usize,
+    #[cfg(feature = "cst")]
+    builder_checkpoint: builder::Checkpoint,
 }
 
 #[derive(PartialEq)]
@@ -73,12 +87,71 @@ pub struct Parser {
     tokens: Vec<Token>,
     /// The index of the first unprocessed token in `self.tokens`
     index: usize,
+
+    #[cfg(feature = "cst")]
+    builder: builder::GreenNodeBuilder<'static>,
+
+    // TBD: the parser currently provides an API to move around the token
+    // stream without restrictions (`next_token`/`prev_token`), while the
+    // `builder` does not. To work around this, we keep a list of "pending"
+    // tokens which have already been processed via `next_token`, but may
+    // be put back via `prev_token`.
+    #[cfg(feature = "cst")]
+    pending: Vec<(cst::SyntaxKind, rowan::SmolStr)>,
+}
+
+/// `ret!(expr => via self.complete(m, SK::FOO, ..)` runs the following steps:
+///   1) Evaluates `expr`, possibly advancing the parser's position in the token stream;
+///   2) Closes the current branch of the CST, identified by `m`, and sets its kind to
+///     `SyntaxKind::FOO`;
+///   3) Returns the value of `expr`, which should be the typed AST node, corresponding
+///     to the recently closed branch.
+/// The weird syntax prevents rustfmt from making each call to this macro take up 5 lines.
+macro_rules! ret {
+    { $e: expr => via $self: ident .complete($m: ident, $syntax_kind: expr, ..) } => {
+        {
+            let rv = $e;
+            $self.complete($m, $syntax_kind, rv)
+        }
+    };
 }
 
 impl Parser {
     /// Parse the specified tokens
     pub fn new(tokens: Vec<Token>) -> Self {
-        Parser { tokens, index: 0 }
+        #[allow(unused_mut)]
+        let mut parser = Parser {
+            tokens,
+            index: 0,
+            #[cfg(feature = "cst")]
+            builder: builder::GreenNodeBuilder::new(),
+            #[cfg(feature = "cst")]
+            pending: vec![],
+        };
+        #[cfg(feature = "cst")]
+        parser.builder.start_node(SK::ROOT.into());
+        parser
+    }
+
+    #[cfg(feature = "cst")]
+    pub fn syntax(mut self) -> cst::SyntaxNode {
+        if self.peek_token().is_some() {
+            // Not at end-of-file: either some extraneous tokens left after
+            // successfully parsing something, or we've bailed with an error.
+            //
+            // TBD: ideally we wouldn't abandon the "current" branch of the
+            // CST on error, instead `.complete()`-ing it as usual, but that's
+            // in conflict with having to return the typed AST, which can't
+            // lack certain bits.
+            self.builder.start_node(SK::ERR.into());
+            while self.next_token().is_some() {}
+            self.builder.finish_node();
+        } else {
+            // TBD: this is required until all parser methods end with `ret!`.
+            self.flush_pending_buffer();
+        }
+        self.builder.finish_node();
+        cst::SyntaxNode::new_root(self.builder.finish())
     }
 
     /// Parse a SQL statement and produce an Abstract Syntax Tree (AST)
@@ -86,22 +159,26 @@ impl Parser {
         let mut tokenizer = Tokenizer::new(dialect, &sql);
         let tokens = tokenizer.tokenize()?;
         let mut parser = Parser::new(tokens);
+        parser.parse_statements()
+    }
+
+    /// Parse zero or more SQL statements delimited with semicolon.
+    pub fn parse_statements(&mut self) -> Result<Vec<Statement>, ParserError> {
         let mut stmts = Vec::new();
         let mut expecting_statement_delimiter = false;
-        debug!("Parsing sql '{}'...", sql);
         loop {
             // ignore empty statements (between successive statement delimiters)
-            while parser.consume_token(&Token::SemiColon) {
+            while self.consume_token(&Token::SemiColon) {
                 expecting_statement_delimiter = false;
             }
 
-            if parser.peek_token().is_none() {
+            if self.peek_token().is_none() {
                 break;
             } else if expecting_statement_delimiter {
-                return parser.expected("end of statement", parser.peek_token());
+                return self.expected("end of statement", self.peek_token());
             }
 
-            let statement = parser.parse_statement()?;
+            let statement = self.parse_statement()?;
             stmts.push(statement);
             expecting_statement_delimiter = true;
         }
@@ -157,9 +234,12 @@ impl Parser {
         self.parse_subexpr(0)
     }
 
-    /// Parse tokens until the precedence changes
+    /// Parse an expression, that either follows an operator with the
+    /// specified `precedence` or starts at the beginning, in which case
+    /// the `precedence` is 0 (representing the lowest binding power).
     pub fn parse_subexpr(&mut self, precedence: u8) -> Result<Expr, ParserError> {
         debug!("parsing expr");
+        let m = self.start();
         let mut expr = self.parse_prefix()?;
         debug!("prefix: {:?}", expr);
         loop {
@@ -169,13 +249,26 @@ impl Parser {
                 break;
             }
 
-            expr = self.parse_infix(expr, next_precedence)?;
+            // Here next_precedence > precedence... i.e. the following operator
+            // has higher binding power than the operator to the left of `expr`
+            // In the following illustration, we're at the second (and the
+            // last) iteration of this loop.
+            //
+            //         expr
+            //       _______
+            // a  +  b  *  c  *  d  +  e
+            //    ^           ^
+            //    |           |< current token (returned by `peek_token()`;
+            // `precedence`                       has `next_precedence`)
+            //
+            expr = self.parse_infix(m.clone(), expr, next_precedence)?;
         }
         Ok(expr)
     }
 
     /// Parse an expression prefix
     pub fn parse_prefix(&mut self) -> Result<Expr, ParserError> {
+        let m = self.start();
         let tok = self
             .next_token()
             .ok_or_else(|| ParserError::ParserError("Unexpected EOF".to_string()))?;
@@ -251,11 +344,14 @@ impl Parser {
             Token::LParen => {
                 let expr = if self.parse_keyword("SELECT") || self.parse_keyword("WITH") {
                     self.prev_token();
-                    Expr::Subquery(Box::new(self.parse_query()?))
+                    let expr = Expr::Subquery(Box::new(self.parse_query()?));
+                    self.expect_token(&Token::RParen)?;
+                    ret!(expr => via self.complete(m, SK::EXPR_SUBQUERY, ..))
                 } else {
-                    Expr::Nested(Box::new(self.parse_expr()?))
+                    let expr = Expr::Nested(Box::new(self.parse_expr()?));
+                    self.expect_token(&Token::RParen)?;
+                    ret!(expr => via self.complete(m, SK::EXPR_NESTED, ..))
                 };
-                self.expect_token(&Token::RParen)?;
                 Ok(expr)
             }
             unexpected => self.expected("an expression", Some(unexpected)),
@@ -360,12 +456,12 @@ impl Parser {
             operand = Some(Box::new(self.parse_expr()?));
             self.expect_keyword("WHEN")?;
         }
-        let mut conditions = vec![];
-        let mut results = vec![];
+        let mut when_clauses = vec![];
         loop {
-            conditions.push(self.parse_expr()?);
+            let condition = self.parse_expr()?;
             self.expect_keyword("THEN")?;
-            results.push(self.parse_expr()?);
+            let result = self.parse_expr()?;
+            when_clauses.push(WhenClause { condition, result });
             if !self.parse_keyword("WHEN") {
                 break;
             }
@@ -378,8 +474,7 @@ impl Parser {
         self.expect_keyword("END")?;
         Ok(Expr::Case {
             operand,
-            conditions,
-            results,
+            when_clauses,
             else_result,
         })
     }
@@ -562,7 +657,12 @@ impl Parser {
     }
 
     /// Parse an operator following an expression
-    pub fn parse_infix(&mut self, expr: Expr, precedence: u8) -> Result<Expr, ParserError> {
+    pub fn parse_infix(
+        &mut self,
+        m: Marker,
+        expr: Expr,
+        precedence: u8,
+    ) -> Result<Expr, ParserError> {
         debug!("parsing infix");
         let tok = self.next_token().unwrap(); // safe as EOF's precedence is the lowest
 
@@ -599,11 +699,12 @@ impl Parser {
         };
 
         if let Some(op) = regular_binary_operator {
-            Ok(Expr::BinaryOp {
-                left: Box::new(expr),
-                op,
-                right: Box::new(self.parse_subexpr(precedence)?),
-            })
+            ret!(Ok(Expr::BinaryOp {
+                    left: Box::new(expr),
+                    op,
+                    right: Box::new(self.parse_subexpr(precedence)?),
+                })
+                => via self.complete(m, SK::BIN_EXPR, ..)) // TBD OTHER
         } else if let Token::Word(ref k) = tok {
             match k.keyword.as_ref() {
                 "IS" => {
@@ -685,7 +786,8 @@ impl Parser {
     const BETWEEN_PREC: u8 = 20;
     const PLUS_MINUS_PREC: u8 = 30;
 
-    /// Get the precedence of the next token
+    /// Get the precedence of the next unprocessed token (or multiple
+    /// tokens, in cases like `NOT IN`)
     pub fn get_next_precedence(&self) -> Result<u8, ParserError> {
         if let Some(token) = self.peek_token() {
             debug!("get_next_precedence() {:?}", token);
@@ -724,6 +826,54 @@ impl Parser {
         }
     }
 
+    pub fn start(&mut self) -> Marker {
+        self.flush_pending_buffer();
+        Marker {
+            index: self.index,
+            #[cfg(feature = "cst")]
+            builder_checkpoint: self.builder.checkpoint(),
+        }
+    }
+
+    fn start_if<F>(&mut self, f: F) -> Option<Marker>
+    where
+        F: FnOnce(&mut Parser) -> bool,
+    {
+        self.flush_pending_buffer();
+        let m = self.start();
+        if f(self) {
+            Some(m)
+        } else {
+            None
+        }
+    }
+
+    pub fn reset(&mut self, m: Marker) {
+        self.index = m.index;
+        #[cfg(feature = "cst")]
+        self.pending.truncate(0);
+        #[cfg(feature = "cst")]
+        self.builder.reset(m.builder_checkpoint);
+    }
+
+    #[allow(unused_variables)]
+    pub fn complete<T>(&mut self, m: Marker, kind: cst::SyntaxKind, rv: T) -> T {
+        self.flush_pending_buffer();
+        #[cfg(feature = "cst")]
+        self.builder
+            .start_node_at(m.builder_checkpoint, kind.into());
+        #[cfg(feature = "cst")]
+        self.builder.finish_node();
+        rv
+    }
+
+    pub fn flush_pending_buffer(&mut self) {
+        #[cfg(feature = "cst")]
+        for (kind, s) in self.pending.drain(..) {
+            self.builder.token(kind.into(), s);
+        }
+    }
+
     /// Return the first non-whitespace token that has not yet been processed
     /// (or None if reached end-of-file)
     pub fn peek_token(&self) -> Option<Token> {
@@ -751,9 +901,10 @@ impl Parser {
     /// (or None if reached end-of-file) and mark it as processed. OK to call
     /// repeatedly after reaching EOF.
     pub fn next_token(&mut self) -> Option<Token> {
+        self.flush_pending_buffer();
+
         loop {
-            self.index += 1;
-            match self.tokens.get(self.index - 1) {
+            match self.next_token_no_skip() {
                 Some(Token::Whitespace(_)) => continue,
                 token => return token.cloned(),
             }
@@ -763,7 +914,15 @@ impl Parser {
     /// Return the first unprocessed token, possibly whitespace.
     pub fn next_token_no_skip(&mut self) -> Option<&Token> {
         self.index += 1;
-        self.tokens.get(self.index - 1)
+        #[allow(clippy::let_and_return)]
+        let token = self.tokens.get(self.index - 1);
+        #[cfg(feature = "cst")]
+        {
+            if let Some(t) = token {
+                self.pending.push((t.kind(), t.to_string().into()));
+            }
+        }
+        token
     }
 
     /// Push back the last one non-whitespace token. Must be called after
@@ -773,8 +932,26 @@ impl Parser {
         loop {
             assert!(self.index > 0);
             self.index -= 1;
+
+            #[cfg(feature = "cst")]
+            {
+                if !self.pending.is_empty() {
+                    self.pending.pop();
+                } else {
+                    assert!(self.index >= self.tokens.len()); // past EOF
+                }
+            }
+
             if let Some(Token::Whitespace(_)) = self.tokens.get(self.index) {
                 continue;
+            }
+
+            // There may be only one non-whitespace token `pending` as by
+            // convention, backtracking (i.e. going more than one token back)
+            // is done via `start`/`reset` instead.
+            #[cfg(feature = "cst")]
+            for tok in &self.pending {
+                assert!(tok.0 == SK::Whitespace);
             }
             return;
         }
@@ -800,6 +977,13 @@ impl Parser {
         match self.peek_token() {
             Some(Token::Word(ref k)) if expected.eq_ignore_ascii_case(&k.keyword) => {
                 self.next_token();
+                // TBD: a hack to change the "kind" of the token just processed
+                #[cfg(feature = "cst")]
+                {
+                    let mut p = self.pending.pop().unwrap();
+                    p.0 = SK::KW;
+                    self.pending.push(p);
+                }
                 true
             }
             _ => false,
@@ -809,12 +993,10 @@ impl Parser {
     /// Look for an expected sequence of keywords and consume them if they exist
     #[must_use]
     pub fn parse_keywords(&mut self, keywords: Vec<&'static str>) -> bool {
-        let index = self.index;
+        let checkpoint = self.start();
         for keyword in keywords {
             if !self.parse_keyword(&keyword) {
-                //println!("parse_keywords aborting .. did not find {}", keyword);
-                // reset index and return immediately
-                self.index = index;
+                self.reset(checkpoint);
                 return false;
             }
         }
@@ -1262,7 +1444,7 @@ impl Parser {
         })
     }
 
-    /// Parse a copy statement
+    /// Parse a PostgreSQL `COPY` statement
     pub fn parse_copy(&mut self) -> Result<Statement, ParserError> {
         let table_name = self.parse_object_name()?;
         let columns = self.parse_parenthesized_column_list(Optional)?;
@@ -1276,14 +1458,8 @@ impl Parser {
         })
     }
 
-    /// Parse a tab separated values in
-    /// COPY payload
+    /// Parse a tab separated values in PostgreSQL `COPY` payload
     fn parse_tsv(&mut self) -> Result<Vec<Option<String>>, ParserError> {
-        let values = self.parse_tab_value()?;
-        Ok(values)
-    }
-
-    fn parse_tab_value(&mut self) -> Result<Vec<Option<String>>, ParserError> {
         let mut values = vec![];
         let mut content = String::from("");
         while let Some(t) = self.next_token_no_skip() {
@@ -1505,6 +1681,7 @@ impl Parser {
     /// Parse a possibly qualified, possibly quoted identifier, e.g.
     /// `foo` or `myschema."table"`
     pub fn parse_object_name(&mut self) -> Result<ObjectName, ParserError> {
+        let m = self.start();
         let mut idents = vec![];
         loop {
             idents.push(self.parse_identifier()?);
@@ -1512,14 +1689,18 @@ impl Parser {
                 break;
             }
         }
-        Ok(ObjectName(idents))
+        ret!(Ok(ObjectName(idents))
+            => via self.complete(m, SK::OBJECT_NAME, ..))
     }
 
     /// Parse a simple one-word identifier (possibly quoted, possibly a keyword)
     pub fn parse_identifier(&mut self) -> Result<Ident, ParserError> {
+        let m = self.start();
         match self.next_token() {
-            Some(Token::Word(w)) => Ok(w.to_ident()),
-            unexpected => self.expected("identifier", unexpected),
+            Some(Token::Word(w)) => ret!(Ok(w.to_ident())
+                => via self.complete(m, SK::IDENT, ..)),
+            unexpected => ret!(self.expected("identifier", unexpected)
+                => via self.complete(m, SK::ERR, ..)),
         }
     }
 
@@ -1586,47 +1767,44 @@ impl Parser {
     /// by `ORDER BY`. Unlike some other parse_... methods, this one doesn't
     /// expect the initial keyword to be already consumed
     pub fn parse_query(&mut self) -> Result<Query, ParserError> {
-        let ctes = if self.parse_keyword("WITH") {
+        let m = self.start();
+        let ctes = if let Some(m) = self.start_if(|p| p.parse_keyword("WITH")) {
             // TODO: optional RECURSIVE
-            self.parse_comma_separated(Parser::parse_cte)?
+            ret!(self.parse_comma_separated(Parser::parse_cte)?
+                => via self.complete(m, SK::CTES, ..))
         } else {
             vec![]
         };
 
         let body = self.parse_query_body(0)?;
 
-        let order_by = if self.parse_keywords(vec!["ORDER", "BY"]) {
-            self.parse_comma_separated(Parser::parse_order_by_expr)?
+        let order_by = if let Some(m) = self.start_if(|p| p.parse_keywords(vec!["ORDER", "BY"])) {
+            ret!(self.parse_comma_separated(Parser::parse_order_by_expr)?
+                => via self.complete(m, SK::ORDER_BY, ..))
         } else {
             vec![]
         };
 
-        let limit = if self.parse_keyword("LIMIT") {
-            self.parse_limit()?
+        let limit = if let Some(_m) = self.start_if(|p| p.parse_keyword("LIMIT")) {
+            self.parse_limit()? // TBD
         } else {
             None
         };
 
-        let offset = if self.parse_keyword("OFFSET") {
-            Some(self.parse_offset()?)
+        let offset = if let Some(_m) = self.start_if(|p| p.parse_keyword("OFFSET")) {
+            Some(self.parse_offset()?) // TBD
         } else {
             None
         };
 
-        let fetch = if self.parse_keyword("FETCH") {
-            Some(self.parse_fetch()?)
+        let fetch = if let Some(_m) = self.start_if(|p| p.parse_keyword("FETCH")) {
+            Some(self.parse_fetch()?) // TBD
         } else {
             None
         };
 
-        Ok(Query {
-            ctes,
-            body,
-            limit,
-            order_by,
-            offset,
-            fetch,
-        })
+        ret!(Ok(Query { ctes, body, limit, order_by, offset, fetch })
+            => via self.complete(m, SK::QUERY, ..))
     }
 
     /// Parse a CTE (`alias [( col1, col2, ... )] AS (subquery)`)
@@ -1653,15 +1831,16 @@ impl Parser {
     fn parse_query_body(&mut self, precedence: u8) -> Result<SetExpr, ParserError> {
         // We parse the expression using a Pratt parser, as in `parse_expr()`.
         // Start by parsing a restricted SELECT or a `(subquery)`:
-        let mut expr = if self.parse_keyword("SELECT") {
-            SetExpr::Select(Box::new(self.parse_select()?))
+        let mut expr = if let Some(m) = self.start_if(|parser| parser.parse_keyword("SELECT")) {
+            ret!(SetExpr::Select(Box::new(self.parse_select()?))
+                => via self.complete(m, SK::SELECT, ..))
         } else if self.consume_token(&Token::LParen) {
             // CTEs are not allowed here, but the parser currently accepts them
             let subquery = self.parse_query()?;
             self.expect_token(&Token::RParen)?;
-            SetExpr::Query(Box::new(subquery))
+            SetExpr::Query(Box::new(subquery)) // TBD
         } else if self.parse_keyword("VALUES") {
-            SetExpr::Values(self.parse_values()?)
+            SetExpr::Values(self.parse_values()?) // TBD
         } else {
             return self.expected(
                 "SELECT, VALUES, or a subquery in the query body",
@@ -1686,6 +1865,7 @@ impl Parser {
             }
             self.next_token(); // skip past the set operator
             expr = SetExpr::SetOperation {
+                // TBD ret!
                 left: Box::new(expr),
                 op: op.unwrap(),
                 all: self.parse_keyword("ALL"),
@@ -1716,21 +1896,24 @@ impl Parser {
             None
         };
 
-        let projection = self.parse_comma_separated(Parser::parse_select_item)?;
+        let m = self.start();
+        let projection = ret!(self.parse_comma_separated(Parser::parse_select_item)?
+            => via self.complete(m, SK::PROJECTION, ..));
 
         // Note that for keywords to be properly handled here, they need to be
         // added to `RESERVED_FOR_COLUMN_ALIAS` / `RESERVED_FOR_TABLE_ALIAS`,
         // otherwise they may be parsed as an alias as part of the `projection`
         // or `from`.
 
-        let from = if self.parse_keyword("FROM") {
-            self.parse_comma_separated(Parser::parse_table_and_joins)?
+        let from = if let Some(m) = self.start_if(|parser| parser.parse_keyword("FROM")) {
+            ret!(self.parse_comma_separated(Parser::parse_table_and_joins)?
+                => via self.complete(m, SK::FROM, ..))
         } else {
             vec![]
         };
 
-        let selection = if self.parse_keyword("WHERE") {
-            Some(self.parse_expr()?)
+        let selection = if let Some(m) = self.start_if(|parser| parser.parse_keyword("WHERE")) {
+            ret!(Some(self.parse_expr()?) => via self.complete(m, SK::WHERE, ..))
         } else {
             None
         };
@@ -1908,7 +2091,7 @@ impl Parser {
         }
 
         if self.consume_token(&Token::LParen) {
-            let index = self.index;
+            let checkpoint = self.start();
             // A left paren introduces either a derived table (i.e., a subquery)
             // or a nested join. It's nearly impossible to determine ahead of
             // time which it is... so we just try to parse both.
@@ -1936,7 +2119,7 @@ impl Parser {
                     // the '(' we've recently consumed does not start a derived table
                     // (cases 1, 2, or 4). Ignore the error and back up to where we
                     // were before - right after the opening '('.
-                    self.index = index;
+                    self.reset(checkpoint);
 
                     // Inside the parentheses we expect to find a table factor
                     // followed by some joins or another level of nesting.
@@ -1998,12 +2181,14 @@ impl Parser {
     fn parse_join_constraint(&mut self, natural: bool) -> Result<JoinConstraint, ParserError> {
         if natural {
             Ok(JoinConstraint::Natural)
-        } else if self.parse_keyword("ON") {
+        } else if let Some(m) = self.start_if(|parser| parser.parse_keyword("ON")) {
             let constraint = self.parse_expr()?;
-            Ok(JoinConstraint::On(constraint))
-        } else if self.parse_keyword("USING") {
+            ret!(Ok(JoinConstraint::On(constraint))
+                => via self.complete(m, SK::JoinConstraint__On, ..))
+        } else if let Some(m) = self.start_if(|parser| parser.parse_keyword("USING")) {
             let columns = self.parse_parenthesized_column_list(Mandatory)?;
-            Ok(JoinConstraint::Using(columns))
+            ret!(Ok(JoinConstraint::Using(columns))
+                => via self.complete(m, SK::JoinConstraint__Using, ..))
         } else {
             self.expected("ON, or USING after JOIN", self.peek_token())
         }
@@ -2058,17 +2243,22 @@ impl Parser {
 
     /// Parse a comma-delimited list of projections after SELECT
     pub fn parse_select_item(&mut self) -> Result<SelectItem, ParserError> {
+        let m = self.start();
         let expr = self.parse_expr()?;
         if let Expr::Wildcard = expr {
-            Ok(SelectItem::Wildcard)
+            ret!(Ok(SelectItem::Wildcard)
+                => via self.complete(m, SK::SELECT_ITEM_WILDCARD, ..))
         } else if let Expr::QualifiedWildcard(prefix) = expr {
-            Ok(SelectItem::QualifiedWildcard(ObjectName(prefix)))
+            ret!(Ok(SelectItem::QualifiedWildcard(ObjectName(prefix)))
+                => via self.complete(m, SK::SELECT_ITEM_QWILDCARD, ..))
         } else {
             // `expr` is a regular SQL expression and can be followed by an alias
             if let Some(alias) = self.parse_optional_alias(keywords::RESERVED_FOR_COLUMN_ALIAS)? {
-                Ok(SelectItem::ExprWithAlias { expr, alias })
+                ret!(Ok(SelectItem::ExprWithAlias { expr, alias })
+                    => via self.complete(m, SK::SELECT_ITEM_EXPR_WITH_ALIAS, ..))
             } else {
-                Ok(SelectItem::UnnamedExpr(expr))
+                ret!(Ok(SelectItem::UnnamedExpr(expr))
+                    => via self.complete(m, SK::SELECT_ITEM_UNNAMED, ..))
             }
         }
     }
