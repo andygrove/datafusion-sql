@@ -19,9 +19,9 @@ use super::dialect::keywords;
 use super::dialect::keywords::Keyword;
 use super::dialect::Dialect;
 use super::tokenizer::*;
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParserError {
     TokenizerError(String),
@@ -87,12 +87,18 @@ pub struct Parser {
     tokens: Vec<Token>,
     /// The index of the first unprocessed token in `self.tokens`
     index: usize,
+    /// Memoizes unsuccesful `parse_derived_table_factor` results
+    memoize_parse_derived_table_factor: HashSet<usize>,
 }
 
 impl Parser {
     /// Parse the specified tokens
     pub fn new(tokens: Vec<Token>) -> Self {
-        Parser { tokens, index: 0 }
+        Parser {
+            tokens,
+            index: 0,
+            memoize_parse_derived_table_factor: HashSet::new(),
+        }
     }
 
     /// Parse a SQL statement and produce an Abstract Syntax Tree (AST)
@@ -2096,9 +2102,19 @@ impl Parser {
             // `parse_derived_table_factor` below will return success after parsing the
             // subquery, followed by the closing ')', and the alias of the derived table.
             // In the example above this is case (3).
-            return_ok_if_some!(
-                self.maybe_parse(|parser| parser.parse_derived_table_factor(NotLateral))
-            );
+
+            // We will only try to parse `parse_derived_table_factor` if it wasn't tried in a
+            // previous attempt for the same index
+            if !self
+                .memoize_parse_derived_table_factor
+                .contains(&self.index)
+            {
+                return_ok_if_some!(
+                    self.maybe_parse(|parser| parser.parse_derived_table_factor(NotLateral))
+                );
+                self.memoize_parse_derived_table_factor.insert(self.index);
+            }
+
             // A parsing error from `parse_derived_table_factor` indicates that the '(' we've
             // recently consumed does not start a derived table (cases 1, 2, or 4).
             // `maybe_parse` will ignore such an error and rewind to be after the opening '('.
