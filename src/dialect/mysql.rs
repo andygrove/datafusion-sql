@@ -24,6 +24,8 @@ impl Dialect for MySqlDialect {
             || ('A'..='Z').contains(&ch)
             || ch == '_'
             || ch == '$'
+            || ch == '@'
+            || ch == '?'
             || ('\u{0080}'..='\u{ffff}').contains(&ch)
     }
 

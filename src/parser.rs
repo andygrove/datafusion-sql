@@ -57,6 +57,7 @@ pub enum IsLateral {
 }
 
 use crate::ast::Statement::CreateVirtualTable;
+use crate::dialect::keywords::{NAMES, TRANSACTION};
 use IsLateral::*;
 
 impl From<TokenizerError> for ParserError {
@@ -150,13 +151,16 @@ impl<'a> Parser<'a> {
                 Keyword::COPY => Ok(self.parse_copy()?),
                 Keyword::SET => Ok(self.parse_set()?),
                 Keyword::SHOW => Ok(self.parse_show()?),
+                Keyword::USE => Ok(self.parse_use()?),
                 Keyword::START => Ok(self.parse_start_transaction()?),
                 // `BEGIN` is a nonstandard but common alias for the
                 // standard `START TRANSACTION` statement. It is supported
                 // by at least PostgreSQL and MySQL.
                 Keyword::BEGIN => Ok(self.parse_begin()?),
                 Keyword::COMMIT => Ok(self.parse_commit()?),
+                Keyword::SAVEPOINT => Ok(self.parse_savepoint()?),
                 Keyword::ROLLBACK => Ok(self.parse_rollback()?),
+                Keyword::RELEASE => Ok(self.parse_release()?),
                 Keyword::ASSERT => Ok(self.parse_assert()?),
                 // `PREPARE`, `EXECUTE` and `DEALLOCATE` are Postgres-specific
                 // syntaxes. They are used for Postgres prepared statement.
@@ -444,6 +448,8 @@ impl<'a> Parser<'a> {
                 self.expect_token(&Token::RParen)?;
                 Ok(expr)
             }
+
+            Token::ParameterMark(index) => Ok(Expr::ParameterMark(index)),
             unexpected => self.expected("an expression:", unexpected),
         }?;
 
@@ -2187,7 +2193,8 @@ impl<'a> Parser<'a> {
                 None
             };
 
-            let offset = if self.parse_keyword(Keyword::OFFSET) {
+            let offset = if self.consume_token(&Token::Comma) || self.parse_keyword(Keyword::OFFSET)
+            {
                 Some(self.parse_offset()?)
             } else {
                 None
@@ -2450,9 +2457,14 @@ impl<'a> Parser<'a> {
                     value: values,
                 });
             }
-        } else if variable.value == "TRANSACTION" && modifier.is_none() {
+        } else if variable.value.to_uppercase() == TRANSACTION {
             Ok(Statement::SetTransaction {
+                session: modifier.is_some(),
                 modes: self.parse_transaction_modes()?,
+            })
+        } else if variable.value.to_uppercase() == NAMES && modifier.is_none() {
+            Ok(Statement::SetNames {
+                variable: self.parse_identifier()?,
             })
         } else {
             self.expected("equals sign or TO", self.peek_token())
@@ -2476,6 +2488,12 @@ impl<'a> Parser<'a> {
                 variable: self.parse_identifiers()?,
             })
         }
+    }
+
+    pub fn parse_use(&mut self) -> Result<Statement, ParserError> {
+        Ok(Statement::UseDatabase {
+            variable: self.parse_identifier()?,
+        })
     }
 
     fn parse_show_columns(&mut self) -> Result<Statement, ParserError> {
@@ -2821,10 +2839,16 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let limit = if self.parse_keyword(Keyword::LIMIT) {
+            self.parse_limit()?
+        } else {
+            None
+        };
         Ok(Statement::Update {
             table_name,
             assignments,
             selection,
+            limit,
         })
     }
 
@@ -2930,13 +2954,13 @@ impl<'a> Parser<'a> {
         if self.parse_keyword(Keyword::ALL) {
             Ok(None)
         } else {
-            Ok(Some(Expr::Value(self.parse_number_value()?)))
+            Ok(Some(self.parse_expr()?))
         }
     }
 
     /// Parse an OFFSET clause
     pub fn parse_offset(&mut self) -> Result<Offset, ParserError> {
-        let value = Expr::Value(self.parse_number_value()?);
+        let value = self.parse_expr()?;
         let rows = if self.parse_keyword(Keyword::ROW) {
             OffsetRows::Row
         } else if self.parse_keyword(Keyword::ROWS) {
@@ -3037,17 +3061,11 @@ impl<'a> Parser<'a> {
 
     pub fn parse_commit(&mut self) -> Result<Statement, ParserError> {
         Ok(Statement::Commit {
-            chain: self.parse_commit_rollback_chain()?,
+            chain: self.parse_commit_chain()?,
         })
     }
 
-    pub fn parse_rollback(&mut self) -> Result<Statement, ParserError> {
-        Ok(Statement::Rollback {
-            chain: self.parse_commit_rollback_chain()?,
-        })
-    }
-
-    pub fn parse_commit_rollback_chain(&mut self) -> Result<bool, ParserError> {
+    pub fn parse_commit_chain(&mut self) -> Result<bool, ParserError> {
         let _ = self.parse_one_of_keywords(&[Keyword::TRANSACTION, Keyword::WORK]);
         if self.parse_keyword(Keyword::AND) {
             let chain = !self.parse_keyword(Keyword::NO);
@@ -3056,6 +3074,46 @@ impl<'a> Parser<'a> {
         } else {
             Ok(false)
         }
+    }
+
+    pub fn parse_savepoint(&mut self) -> Result<Statement, ParserError> {
+        Ok(Statement::Savepoint {
+            variable: self.parse_identifier()?,
+        })
+    }
+
+    pub fn parse_rollback(&mut self) -> Result<Statement, ParserError> {
+        self.parse_rollback_chain_or_to()
+    }
+
+    pub fn parse_rollback_chain_or_to(&mut self) -> Result<Statement, ParserError> {
+        let _ = self.parse_one_of_keywords(&[Keyword::TRANSACTION, Keyword::WORK]);
+        if self.parse_keyword(Keyword::AND) {
+            let chain = !self.parse_keyword(Keyword::NO);
+            self.expect_keyword(Keyword::CHAIN)?;
+            Ok(Statement::Rollback {
+                chain,
+                savepoint: None,
+            })
+        } else if self.parse_keyword(Keyword::TO) {
+            let _ = self.parse_one_of_keywords(&[Keyword::SAVEPOINT]);
+            Ok(Statement::Rollback {
+                chain: false,
+                savepoint: Some(self.parse_identifier()?),
+            })
+        } else {
+            Ok(Statement::Rollback {
+                chain: false,
+                savepoint: None,
+            })
+        }
+    }
+
+    pub fn parse_release(&mut self) -> Result<Statement, ParserError> {
+        self.expect_keyword(Keyword::SAVEPOINT)?;
+        Ok(Statement::Release {
+            variable: self.parse_identifier()?,
+        })
     }
 
     fn parse_deallocate(&mut self) -> Result<Statement, ParserError> {

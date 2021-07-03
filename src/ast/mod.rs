@@ -34,6 +34,7 @@ pub use self::query::{
     Values, With,
 };
 pub use self::value::{DateTimeField, Value};
+use std::option::Option::Some;
 
 struct DisplaySeparated<'a, T>
 where
@@ -259,6 +260,8 @@ pub enum Expr {
     Subquery(Box<Query>),
     /// The `LISTAGG` function `SELECT LISTAGG(...) WITHIN GROUP (ORDER BY ...)`
     ListAgg(ListAgg),
+    /// `?` Parameter Mark
+    ParameterMark(u32),
 }
 
 impl fmt::Display for Expr {
@@ -362,6 +365,7 @@ impl fmt::Display for Expr {
 
                 write!(f, ")")
             }
+            Expr::ParameterMark(_) => write!(f, "?"),
         }
     }
 }
@@ -556,6 +560,8 @@ pub enum Statement {
         assignments: Vec<Assignment>,
         /// WHERE
         selection: Option<Expr>,
+        /// `LIMIT { <N> | ALL }`
+        limit: Option<Expr>,
     },
     /// DELETE
     Delete {
@@ -647,6 +653,10 @@ pub enum Statement {
     ///
     /// Note: this is a PostgreSQL-specific statement.
     ShowVariable { variable: Vec<Ident> },
+    /// USE <variable>
+    ///
+    /// Note: this is a MySQL-specific statement.
+    UseDatabase { variable: Ident },
     /// SHOW COLUMNS
     ///
     /// Note: this is a MySQL-specific statement.
@@ -658,12 +668,27 @@ pub enum Statement {
     },
     /// `{ BEGIN [ TRANSACTION | WORK ] | START TRANSACTION } ...`
     StartTransaction { modes: Vec<TransactionMode> },
-    /// `SET TRANSACTION ...`
-    SetTransaction { modes: Vec<TransactionMode> },
+    /// `SET [SESSION] TRANSACTION ...`
+    SetTransaction {
+        session: bool,
+        modes: Vec<TransactionMode>,
+    },
+    /// SET NAMES <variable>
+    ///
+    /// Note: this is a MySQL-specific statement.
+    SetNames { variable: Ident },
     /// `COMMIT [ TRANSACTION | WORK ] [ AND [ NO ] CHAIN ]`
     Commit { chain: bool },
+    /// `SAVEPOINT identifier`
+    Savepoint { variable: Ident },
     /// `ROLLBACK [ TRANSACTION | WORK ] [ AND [ NO ] CHAIN ]`
-    Rollback { chain: bool },
+    /// `ROLLBACK [WORK] TO [SAVEPOINT] identifier`
+    Rollback {
+        chain: bool,
+        savepoint: Option<Ident>,
+    },
+    /// RELEASE SAVEPOINT identifier
+    Release { variable: Ident },
     /// CREATE SCHEMA
     CreateSchema {
         schema_name: ObjectName,
@@ -876,6 +901,7 @@ impl fmt::Display for Statement {
                 table_name,
                 assignments,
                 selection,
+                limit,
             } => {
                 write!(f, "UPDATE {}", table_name)?;
                 if !assignments.is_empty() {
@@ -883,6 +909,9 @@ impl fmt::Display for Statement {
                 }
                 if let Some(selection) = selection {
                     write!(f, " WHERE {}", selection)?;
+                }
+                if let Some(ref limit) = limit {
+                    write!(f, " LIMIT {}", limit)?;
                 }
                 Ok(())
             }
@@ -1158,6 +1187,10 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
+            Statement::UseDatabase { variable } => {
+                write!(f, "USE {}", variable)?;
+                Ok(())
+            }
             Statement::ShowColumns {
                 extended,
                 full,
@@ -1183,18 +1216,38 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
-            Statement::SetTransaction { modes } => {
-                write!(f, "SET TRANSACTION")?;
+            Statement::SetTransaction { session, modes } => {
+                write!(
+                    f,
+                    "SET{} TRANSACTION",
+                    if *session { " SESSION" } else { "" }
+                )?;
                 if !modes.is_empty() {
                     write!(f, " {}", display_comma_separated(modes))?;
                 }
                 Ok(())
             }
+            Statement::SetNames { variable } => {
+                write!(f, "SET NAMES {}", variable)?;
+                Ok(())
+            }
             Statement::Commit { chain } => {
                 write!(f, "COMMIT{}", if *chain { " AND CHAIN" } else { "" },)
             }
-            Statement::Rollback { chain } => {
-                write!(f, "ROLLBACK{}", if *chain { " AND CHAIN" } else { "" },)
+            Statement::Savepoint { variable } => {
+                write!(f, "SAVEPOINT {}", variable)?;
+                Ok(())
+            }
+            Statement::Rollback { chain, savepoint } => {
+                if let Some(savepoint) = savepoint {
+                    write!(f, "ROLLBACK TO SAVEPOINT {}", savepoint)
+                } else {
+                    write!(f, "ROLLBACK{}", if *chain { " AND CHAIN" } else { "" },)
+                }
+            }
+            Statement::Release { variable } => {
+                write!(f, "RELEASE SAVEPOINT {}", variable)?;
+                Ok(())
             }
             Statement::CreateSchema {
                 schema_name,
